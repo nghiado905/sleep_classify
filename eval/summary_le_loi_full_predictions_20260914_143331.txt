@@ -1,0 +1,34 @@
+======================================================================
+========================= EVALUATION REPORT ==========================
+======================================================================
+  Time            : 2026-09-14 14:33:31
+  Source CSV      : D:\SDS\classfy_sleep\output\le_loi_full\predictions.csv
+  Run name        : le_loi_full_predictions
+  Total samples   : 461
+  Positive class  : sleep
+  Classes         : ['normal', 'sleep']
+----------------------------------------------------------------------
+--------------------- CONFUSION MATRIX (Binary) ----------------------
+  TP (True Positive)  :    327
+  FP (False Positive) :     18
+  TN (True Negative)  :     95
+  FN (False Negative) :     21
+----------------------------------------------------------------------
+------------------------------ METRICS -------------------------------
+  Accuracy    : 0.9154  (91.54%)
+  Precision   : 0.9478  (94.78%)
+  Recall      : 0.9397  (93.97%)
+  F1-Score    : 0.9437  (94.37%)
+  Specificity : 0.8407  (84.07%)
+----------------------------------------------------------------------
+------------------------- LABEL DISTRIBUTION -------------------------
+  Class                 GT     Pred
+  normal               113      116
+  sleep                348      345
+======================================================================
+
+Ma trận nhầm lẫn (positive = 'sleep'):
+
+                    Pred   sleep      Pred other
+  Actual sleep          TP=327            FN=21    
+  Actual other          FP=18             TN=95    
