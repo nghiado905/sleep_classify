@@ -58,4 +58,4 @@ models/
 *.log
 tmp/
 temp/
-/data
+data/
