@@ -46,7 +46,7 @@ models/
 *.engine
 *.torchscript
 *.tflite
-
+.dvc/
 # Dataset archives
 *.zip
 *.rar
@@ -58,3 +58,4 @@ models/
 *.log
 tmp/
 temp/
+/data
