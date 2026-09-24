@@ -1,0 +1,11 @@
+# Dataset configuration for 2-class Human Detection
+# Update 'path' to your dataset directory or use relative paths from dataset folder
+path: /path/to/your/dataset
+train: images/train
+val: images/val
+test: images/test
+
+nc: 2
+names:
+  0: head
+  1: visible-person

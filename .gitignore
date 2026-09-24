@@ -7,7 +7,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
-./datasets/
+
 # Virtual environments
 .venv/
 venv/
@@ -29,24 +29,49 @@ desktop.ini
 .env.*
 !.env.example
 
-# Datasets and generated classification output
+# Local datasets and media
+data/
 datasets/
 dataset/
 dataset_cls/
-docs/
+archive/
+sample/
+videos/
 test_cases/
-# Training / inference artifacts
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.mpeg
+*.mpg
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tif
+*.tiff
+*.webp
+
+# Training and inference artifacts
 runs/
-output/
-# Model weights and exported models
+weights/
 models/
+output/
+output_*/
+outputs/
+predictions.csv
+
+# Model weights and exported models
 *.pt
 *.pth
+*.ckpt
 *.onnx
 *.engine
 *.torchscript
 *.tflite
-.dvc/
+*.safetensors
+
 # Dataset archives
 *.zip
 *.rar
@@ -58,4 +83,9 @@ models/
 *.log
 tmp/
 temp/
-data/
+
+# MLflow and DVC logs
+mlflow.db
+mlruns/
+dvclive/
+.dvc/config.local

@@ -1,4 +1,8 @@
 ultralytics
+dvclive
+mlflow
+fastapi
+uvicorn
 opencv-python
 numpy
 roboflow
