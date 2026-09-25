@@ -42,16 +42,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sleep-conf", type=float, default=0.5)
     parser.add_argument("--raisehand-conf", type=float, default=0.5)
     parser.add_argument("--iou", type=float, default=0.45)
-    parser.add_argument("--include-normal", action="store_true")
-    parser.add_argument("--save-video", action="store_true")
+    parser.add_argument(
+        "--exclude-normal", action="store_true",
+        help="Do not save normal/reading/writing detections.",
+    )
+    parser.add_argument(
+        "--save-video", action=argparse.BooleanOptionalAction, default=True,
+        help="Save annotated videos (default: enabled).",
+    )
     return parser.parse_args()
 
 
-def draw(image, box, label: str, confidence: float) -> None:
+def draw(image, box, label: str, raw_name: str, confidence: float) -> None:
     x1, y1, x2, y2 = box
     color = COLORS[label]
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-    text = f"{label} {confidence:.2f}"
+    text = f"{label} [{raw_name}] {confidence:.2f}"
     (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
     cv2.rectangle(image, (x1, max(0, y1 - text_h - 8)), (x1 + text_w + 6, y1), color, -1)
     cv2.putText(image, text, (x1 + 3, max(text_h, y1 - 5)),
@@ -98,7 +104,7 @@ def main(args: argparse.Namespace) -> int:
         detections = []
 
         for prediction in sleep_model.predict_all(image, args.sleep_conf, args.iou):
-            if prediction.class_id == 0 and not args.include_normal:
+            if prediction.class_id == 0 and args.exclude_normal:
                 continue
             label = "normal" if prediction.class_id == 0 else "sleep"
             detections.append(("drowsiness", prediction.class_id, prediction.class_name,
@@ -106,7 +112,7 @@ def main(args: argparse.Namespace) -> int:
 
         result = raise_model.predict(
             source=image, imgsz=args.imgsz, conf=args.raisehand_conf, iou=args.iou,
-            device=args.device, classes=[0], verbose=False,
+            device=args.device, verbose=False,
         )[0]
         if result.boxes is not None:
             for box, confidence, class_id in zip(
@@ -118,8 +124,11 @@ def main(args: argparse.Namespace) -> int:
                     min(width, int(round(box[2]))), min(height, int(round(box[3]))),
                 )
                 if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
+                    label = "raisehand" if class_id == 0 else "normal"
+                    if label == "normal" and args.exclude_normal:
+                        continue
                     detections.append(("raisehand", class_id, str(raise_model.names[class_id]),
-                                       float(confidence), "raisehand", clipped))
+                                       float(confidence), label, clipped))
 
         annotated = image.copy()
         yolo_lines = []
@@ -129,7 +138,7 @@ def main(args: argparse.Namespace) -> int:
             x1, y1, x2, y2 = box
             cv2.imwrite(str(crop_path), image[y1:y2, x1:x2])
             yolo_lines.append(yolo_line(class_id, box, width, height))
-            draw(annotated, box, label, confidence)
+            draw(annotated, box, label, raw_name, confidence)
             counts[label] += 1
             rows.append({
                 "source": str(source), "frame_index": frame_index, "model": model_name,
