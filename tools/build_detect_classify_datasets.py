@@ -294,8 +294,8 @@ def run(args: argparse.Namespace) -> int:
         )
         image_output = unique_path(yolo_root / "images", frame_stem, ".jpg")
         label_output = yolo_root / "labels" / f"{image_output.stem}.txt"
-        lines = []
-        visualized = image.copy() if args.visualize else None
+        detections = []
+        frame_reasons: set[str] = set()
         tracks = tracks_by_source.setdefault(source_path, [])
         max_track_age = max(1, int(round(fps * 3.0)))
         tracks[:] = [
@@ -339,37 +339,65 @@ def run(args: argparse.Namespace) -> int:
             if track is None:
                 track = TrackState(box, label, frame_index, frame_index)
                 tracks.append(track)
-                should_save = True
-                sample_reason = "new_person"
+                object_should_save = True
+                object_reason = "new_person"
             else:
                 interval_frames = max(1, int(round(sample_seconds[label] * fps)))
-                should_save = (
+                object_should_save = (
                     not args.adaptive_sampling
                     or label_changed
                     or is_uncertain
                     or frame_index - track.last_saved_frame >= interval_frames
                 )
                 if label_changed:
-                    sample_reason = "label_changed"
+                    object_reason = "label_changed"
                 elif is_uncertain:
-                    sample_reason = "uncertain"
+                    object_reason = "uncertain"
                 else:
-                    sample_reason = "interval"
+                    object_reason = "interval"
                 track.box = box
                 track.label = label
                 track.last_seen_frame = frame_index
             used_track_ids.add(id(track))
 
             if not args.adaptive_sampling:
-                should_save = True
-                sample_reason = "all_frames"
-            if not should_save:
-                skipped[f"adaptive_{label}"] += 1
-                continue
-            track.last_saved_frame = frame_index
-
+                object_should_save = True
+                object_reason = "all_frames"
+            if object_should_save:
+                frame_reasons.add(object_reason)
             class_id = CLASS_TO_ID[label]
             line = yolo_line(class_id, box, width, height)
+            detections.append({
+                "box_index": box_index, "box": box, "crop": crop, "track": track,
+                "label": label, "label_confidence": label_confidence,
+                "class_id": class_id, "line": line, "sleep_id": sleep_id,
+                "sleep_conf": sleep_conf, "raise_id": raise_id, "raise_conf": raise_conf,
+            })
+
+        if not detections:
+            skipped["no_visible_person"] += 1
+            continue
+        if args.adaptive_sampling and not frame_reasons:
+            skipped["adaptive_frame"] += 1
+            continue
+
+        sample_reason = "+".join(sorted(frame_reasons)) or "all_frames"
+        lines = []
+        visualized = image.copy() if args.visualize else None
+        for detection in detections:
+            box_index = detection["box_index"]
+            box = detection["box"]
+            crop = detection["crop"]
+            track = detection["track"]
+            label = detection["label"]
+            label_confidence = detection["label_confidence"]
+            class_id = detection["class_id"]
+            line = detection["line"]
+            sleep_id, sleep_conf = detection["sleep_id"], detection["sleep_conf"]
+            raise_id, raise_conf = detection["raise_id"], detection["raise_conf"]
+            x1, y1, x2, y2 = box
+
+            track.last_saved_frame = frame_index
             lines.append(line)
             crop_path = unique_path(
                 cls_root / label, f"{frame_stem}_box{box_index:03d}_{label}", ".jpg"
@@ -388,13 +416,10 @@ def run(args: argparse.Namespace) -> int:
                 "raisehand_confidence": f"{raise_conf:.6f}", "yolo_line": line,
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
             })
-        if lines:
-            cv2.imwrite(str(image_output), image)
-            label_output.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            if visualized is not None:
-                cv2.imwrite(str(output / "visualize" / image_output.name), visualized)
-        else:
-            skipped["no_visible_person"] += 1
+        cv2.imwrite(str(image_output), image)
+        label_output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if visualized is not None:
+            cv2.imwrite(str(output / "visualize" / image_output.name), visualized)
 
     fieldnames = [
         "source", "frame_index", "sample_reason", "yolo_image", "yolo_label", "crop",

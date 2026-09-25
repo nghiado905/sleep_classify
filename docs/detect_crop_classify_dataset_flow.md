@@ -46,7 +46,7 @@ Frame video duoc dat ten theo mau `<ten_video>_<frame_index>.jpg`, vi du
 
 ## Adaptive sampling
 
-Dung `--adaptive-sampling` de ghep nguoi giua cac frame bang IoU va luu theo chu ky:
+Dung `--adaptive-sampling` de ghep nguoi giua cac frame bang IoU va chon frame theo chu ky:
 
 - `normal`: 5 giay
 - `sleep`: 1 giay
@@ -56,3 +56,6 @@ Dung `--adaptive-sampling` de ghep nguoi giua cac frame bang IoU va luu theo chu
 Co the doi bang `--normal-seconds`, `--sleep-seconds`, `--raisehand-seconds`,
 `--uncertain-confidence` va `--track-iou`. Ly do chon crop nam trong cot
 `sample_reason` cua `metadata.csv`.
+
+Adaptive chi quyet dinh co luu ca frame hay khong. Khi mot frame duoc chon, toan bo
+nguoi, bbox va crop trong frame deu duoc luu; file YOLO khong bi thieu vat the.
