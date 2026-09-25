@@ -13,8 +13,10 @@ from tqdm import tqdm
 from build_detect_classify_datasets import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
+    clip_xyxy,
     collect_inputs,
     iter_frames,
+    resolve_visible_ids,
     unique_path,
     yolo_line,
 )
@@ -23,7 +25,8 @@ from yolov5_drowsiness import YoloV5DrowsinessDetector
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SLEEP_MODEL = ROOT / "videos" / "drowsiness_yolov5_best.onnx"
-DEFAULT_RAISE_MODEL = ROOT / "classroom_behavior_yolov8x_fold0_best.pt"
+DEFAULT_RAISE_MODEL = ROOT / "videos" / "classroom_behavior_yolov8x_fold0_best.pt"
+DEFAULT_PERSON_MODEL = ROOT / "videos" / "human_detection_2class.pt"
 COLORS = {"normal": (60, 180, 75), "sleep": (30, 80, 230), "raisehand": (0, 200, 255)}
 TARGET_IDS = {"normal": 0, "sleep": 1, "raisehand": 2}
 
@@ -33,18 +36,21 @@ def parse_args() -> argparse.Namespace:
         description="Predict sleep and raise-hand boxes, crops, CSV and YOLO labels."
     )
     parser.add_argument("sources", type=Path, nargs="+")
+    parser.add_argument("--person-model", type=Path, default=DEFAULT_PERSON_MODEL)
     parser.add_argument("--sleep-model", type=Path, default=DEFAULT_SLEEP_MODEL)
     parser.add_argument("--raisehand-model", type=Path, default=DEFAULT_RAISE_MODEL)
     parser.add_argument("--output", type=Path, default=ROOT / "runs" / "behavior_predict")
     parser.add_argument("--device", default=None, help="Ultralytics device: 0 or cpu")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--person-conf", type=float, default=0.25)
     parser.add_argument("--sleep-conf", type=float, default=0.5)
     parser.add_argument("--raisehand-conf", type=float, default=0.5)
     parser.add_argument("--iou", type=float, default=0.45)
+    parser.add_argument("--visible-class", default="visible-person")
     parser.add_argument(
         "--exclude-normal", action="store_true",
-        help="Do not save normal/reading/writing detections.",
+        help="Do not save visible-person boxes that have no matched event.",
     )
     parser.add_argument(
         "--save-video", action=argparse.BooleanOptionalAction, default=True,
@@ -64,6 +70,17 @@ def draw(image, box, label: str, raw_name: str, confidence: float) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
 
+def intersection_over_box(event_box, person_box) -> float:
+    """Fraction of an event box covered by a person box."""
+    ex1, ey1, ex2, ey2 = event_box
+    px1, py1, px2, py2 = person_box
+    ix1, iy1 = max(ex1, px1), max(ey1, py1)
+    ix2, iy2 = min(ex2, px2), min(ey2, py2)
+    intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    event_area = max(1, (ex2 - ex1) * (ey2 - ey1))
+    return intersection / event_area
+
+
 def main(args: argparse.Namespace) -> int:
     from ultralytics import YOLO
 
@@ -75,6 +92,9 @@ def main(args: argparse.Namespace) -> int:
         raise SystemExit("No input images or videos found.")
     if args.frame_stride < 1:
         raise SystemExit("--frame-stride must be at least 1.")
+    for model_path in (args.person_model, args.sleep_model, args.raisehand_model):
+        if not model_path.resolve().is_file():
+            raise SystemExit(f"Model not found: {model_path.resolve()}")
 
     output = args.output.resolve()
     crops_root = output / "crops"
@@ -88,8 +108,13 @@ def main(args: argparse.Namespace) -> int:
     if args.save_video:
         videos_root.mkdir(parents=True, exist_ok=True)
 
+    person_model = YOLO(str(args.person_model.resolve()))
     sleep_model = YoloV5DrowsinessDetector(args.sleep_model.resolve(), args.device, args.imgsz)
     raise_model = YOLO(str(args.raisehand_model.resolve()))
+    visible_ids = resolve_visible_ids(person_model.names, args.visible_class)
+    if not visible_ids:
+        raise SystemExit(f"Visible class not found in person model names: {person_model.names}")
+    print(f"Person model: {args.person_model.resolve()} | names={person_model.names}")
     print(f"Sleep model: {args.sleep_model.resolve()}")
     print(f"Raise-hand model: {args.raisehand_model.resolve()} | names={raise_model.names}")
 
@@ -101,18 +126,17 @@ def main(args: argparse.Namespace) -> int:
     ):
         height, width = image.shape[:2]
         stem = source.stem if source.suffix.lower() in IMAGE_EXTENSIONS else f"{source.stem}_{frame_index:08d}"
-        detections = []
+        events = []
 
         for prediction in sleep_model.predict_all(image, args.sleep_conf, args.iou):
-            if prediction.class_id == 0 and args.exclude_normal:
+            if prediction.class_id not in {1, 2, 3}:
                 continue
-            label = "normal" if prediction.class_id == 0 else "sleep"
-            detections.append(("drowsiness", prediction.class_id, prediction.class_name,
-                               prediction.confidence, label, prediction.box))
+            events.append(("drowsiness", prediction.class_id, prediction.class_name,
+                           prediction.confidence, "sleep", prediction.box))
 
         result = raise_model.predict(
             source=image, imgsz=args.imgsz, conf=args.raisehand_conf, iou=args.iou,
-            device=args.device, verbose=False,
+            device=args.device, classes=[0], verbose=False,
         )[0]
         if result.boxes is not None:
             for box, confidence, class_id in zip(
@@ -124,11 +148,37 @@ def main(args: argparse.Namespace) -> int:
                     min(width, int(round(box[2]))), min(height, int(round(box[3]))),
                 )
                 if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
-                    label = "raisehand" if class_id == 0 else "normal"
-                    if label == "normal" and args.exclude_normal:
-                        continue
-                    detections.append(("raisehand", class_id, str(raise_model.names[class_id]),
-                                       float(confidence), label, clipped))
+                    events.append(("raisehand", class_id, str(raise_model.names[class_id]),
+                                   float(confidence), "raisehand", clipped))
+
+        person_result = person_model.predict(
+            source=image, imgsz=args.imgsz, conf=args.person_conf, iou=args.iou,
+            device=args.device, classes=sorted(visible_ids), verbose=False,
+        )[0]
+        detections = []
+        if person_result.boxes is not None:
+            for raw_person_box, person_confidence in zip(
+                person_result.boxes.xyxy.cpu().numpy(),
+                person_result.boxes.conf.cpu().numpy(),
+            ):
+                person_box = clip_xyxy(raw_person_box, width, height)
+                if person_box is None:
+                    continue
+                matched_events = [
+                    event for event in events
+                    if event[5] is not None
+                    and intersection_over_box(event[5], person_box) >= 0.5
+                ]
+                if matched_events:
+                    best_event = max(matched_events, key=lambda event: event[3])
+                    model_name, raw_id, raw_name, confidence, label, output_box = best_event
+                else:
+                    model_name, raw_id, raw_name = "person", -1, "visible-person"
+                    confidence, label = float(person_confidence), "normal"
+                    output_box = person_box
+                if label == "normal" and args.exclude_normal:
+                    continue
+                detections.append((model_name, raw_id, raw_name, confidence, label, output_box))
 
         annotated = image.copy()
         yolo_lines = []
