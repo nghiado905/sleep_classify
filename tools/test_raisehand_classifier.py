@@ -93,7 +93,8 @@ def run(args: argparse.Namespace) -> int:
 
     output = unique_output_dir(args.output)
     visualize_dir = output / "visualize"
-    visualize_dir.mkdir()
+    for label in ("normal", "raisehand"):
+        (visualize_dir / label).mkdir(parents=True)
     model = YOLO(str(model_path))
     print(f"Model: {model_path}")
     print(f"Task: {model.task}")
@@ -127,16 +128,17 @@ def run(args: argparse.Namespace) -> int:
         counts[final_label] += 1
 
         output_name = f"{index:06d}_{image_path.stem}.jpg"
+        visualize_path = visualize_dir / final_label / output_name
         visualized = image.copy()
         draw_result(
             visualized,
             f"raw={raw_name} ({raw_id}) conf={confidence:.3f} -> {final_label} ({final_class_id})",
             is_raisehand,
         )
-        cv2.imwrite(str(visualize_dir / output_name), visualized)
+        cv2.imwrite(str(visualize_path), visualized)
         rows.append({
             "source": str(image_path),
-            "visualize": str(visualize_dir / output_name),
+            "visualize": str(visualize_path),
             "raw_class_id": raw_id,
             "raw_class_name": raw_name,
             "confidence": f"{confidence:.6f}",
