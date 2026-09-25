@@ -121,9 +121,29 @@ def main(args: argparse.Namespace) -> int:
     rows = []
     counts = Counter()
     writers: dict[Path, cv2.VideoWriter] = {}
+    log_file = (output / "predict.log").open("w", encoding="utf-8")
+
+    def log(message: str) -> None:
+        tqdm.write(message)
+        log_file.write(message + "\n")
+        log_file.flush()
+
+    current_source: Path | None = None
+    source_counts = Counter()
     for source, frame_index, fps, image in tqdm(
         iter_frames(inputs, args.frame_stride), desc="Predict"
     ):
+        if source != current_source:
+            if current_source is not None:
+                log(
+                    f"VIDEO DONE: {current_source.name} | frames={source_counts['frames']} "
+                    f"normal={source_counts['normal']} sleep={source_counts['sleep']} "
+                    f"raisehand={source_counts['raisehand']}"
+                )
+            current_source = source
+            source_counts = Counter()
+            log(f"VIDEO START: {source}")
+        source_counts["frames"] += 1
         height, width = image.shape[:2]
         stem = source.stem if source.suffix.lower() in IMAGE_EXTENSIONS else f"{source.stem}_{frame_index:08d}"
         events = []
@@ -133,6 +153,10 @@ def main(args: argparse.Namespace) -> int:
                 continue
             events.append(("drowsiness", prediction.class_id, prediction.class_name,
                            prediction.confidence, "sleep", prediction.box))
+            log(
+                f"  frame={frame_index} SLEEP raw={prediction.class_name} "
+                f"conf={prediction.confidence:.3f} box={prediction.box}"
+            )
 
         result = raise_model.predict(
             source=image, imgsz=args.imgsz, conf=args.raisehand_conf, iou=args.iou,
@@ -150,35 +174,59 @@ def main(args: argparse.Namespace) -> int:
                 if clipped[2] > clipped[0] and clipped[3] > clipped[1]:
                     events.append(("raisehand", class_id, str(raise_model.names[class_id]),
                                    float(confidence), "raisehand", clipped))
+                    log(
+                        f"  frame={frame_index} RAISEHAND raw={raise_model.names[class_id]} "
+                        f"conf={float(confidence):.3f} box={clipped}"
+                    )
 
         person_result = person_model.predict(
             source=image, imgsz=args.imgsz, conf=args.person_conf, iou=args.iou,
             device=args.device, classes=sorted(visible_ids), verbose=False,
         )[0]
-        detections = []
+        people = []
         if person_result.boxes is not None:
-            for raw_person_box, person_confidence in zip(
+            for person_index, (raw_person_box, person_confidence) in enumerate(zip(
                 person_result.boxes.xyxy.cpu().numpy(),
                 person_result.boxes.conf.cpu().numpy(),
-            ):
+            ), 1):
                 person_box = clip_xyxy(raw_person_box, width, height)
                 if person_box is None:
                     continue
-                matched_events = [
-                    event for event in events
-                    if event[5] is not None
-                    and intersection_over_box(event[5], person_box) >= 0.5
-                ]
-                if matched_events:
-                    best_event = max(matched_events, key=lambda event: event[3])
-                    model_name, raw_id, raw_name, confidence, label, output_box = best_event
-                else:
-                    model_name, raw_id, raw_name = "person", -1, "visible-person"
-                    confidence, label = float(person_confidence), "normal"
-                    output_box = person_box
-                if label == "normal" and args.exclude_normal:
-                    continue
-                detections.append((model_name, raw_id, raw_name, confidence, label, output_box))
+                people.append((person_box, float(person_confidence)))
+                log(
+                    f"  frame={frame_index} PERSON id={len(people)} "
+                    f"conf={float(person_confidence):.3f} box={person_box}"
+                )
+
+        events_by_person: dict[int, list[tuple]] = {index: [] for index in range(len(people))}
+        for event in events:
+            scores = [intersection_over_box(event[5], person[0]) for person in people]
+            best_person = max(range(len(scores)), key=scores.__getitem__) if scores else None
+            if best_person is not None and scores[best_person] >= 0.5:
+                events_by_person[best_person].append(event)
+                log(
+                    f"  frame={frame_index} MATCH {event[4]} box={event[5]} "
+                    f"-> person={best_person + 1} overlap={scores[best_person]:.3f}"
+                )
+            else:
+                log(
+                    f"  frame={frame_index} UNMATCHED {event[4]} box={event[5]} "
+                    f"best_overlap={max(scores, default=0.0):.3f}"
+                )
+
+        detections = []
+        for person_index, (person_box, person_confidence) in enumerate(people):
+            matched_events = events_by_person[person_index]
+            if matched_events:
+                for event in matched_events:
+                    model_name, raw_id, raw_name, confidence, label, event_box = event
+                    detections.append(
+                        (model_name, raw_id, raw_name, confidence, label, event_box)
+                    )
+            elif not args.exclude_normal:
+                detections.append(
+                    ("person", -1, "visible-person", person_confidence, "normal", person_box)
+                )
 
         annotated = image.copy()
         yolo_lines = []
@@ -190,6 +238,11 @@ def main(args: argparse.Namespace) -> int:
             yolo_lines.append(yolo_line(class_id, box, width, height))
             draw(annotated, box, label, raw_name, confidence)
             counts[label] += 1
+            source_counts[label] += 1
+            log(
+                f"  frame={frame_index} OUTPUT label={label} class={class_id} "
+                f"model={model_name} raw={raw_name} conf={confidence:.3f} box={box}"
+            )
             rows.append({
                 "source": str(source), "frame_index": frame_index, "model": model_name,
                 "raw_class_id": raw_id, "raw_class_name": raw_name,
@@ -212,8 +265,15 @@ def main(args: argparse.Namespace) -> int:
                 writers[source] = writer
             writer.write(annotated)
 
+    if current_source is not None:
+        log(
+            f"VIDEO DONE: {current_source.name} | frames={source_counts['frames']} "
+            f"normal={source_counts['normal']} sleep={source_counts['sleep']} "
+            f"raisehand={source_counts['raisehand']}"
+        )
     for writer in writers.values():
         writer.release()
+    log_file.close()
     fields = ["source", "frame_index", "model", "raw_class_id", "raw_class_name",
               "label", "class_id", "confidence", "x1", "y1", "x2", "y2", "crop"]
     with (output / "predictions.csv").open("w", newline="", encoding="utf-8-sig") as file:
