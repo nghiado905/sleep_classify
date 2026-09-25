@@ -66,7 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iou", type=float, default=0.7)
     parser.add_argument("--visible-class", default="visible person")
     parser.add_argument("--sleep-positive-id", type=int, default=1)
-    parser.add_argument("--raisehand-positive-id", type=int, default=2)
+    parser.add_argument(
+        "--raisehand-positive-id", type=int, default=1,
+        help="Raw positive class ID returned by the raise-hand classifier. Default: 1",
+    )
     parser.add_argument("--frame-stride", type=int, default=3)
     parser.add_argument(
         "--similarity-threshold", type=float, default=0.985,

@@ -11,7 +11,7 @@ flowchart TD
     D2[Model raise hand]
     D1 --> E{Gop ket qua}
     D2 --> E
-    E -- raisehand model = class 2 --> R[raisehand: class 2]
+    E -- raisehand model raw class 1 --> R[raisehand: YOLO class 2]
     E -- khong raisehand, sleep model = class 1 --> S[sleep: class 1]
     E -- con lai --> N[normal: class 0]
     R --> Y[dataset_yolo: anh goc + bbox]

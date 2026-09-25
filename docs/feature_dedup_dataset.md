@@ -54,3 +54,6 @@ Khi bat dau, script in duong dan va `names` cua ca ba model. Sau moi video, log
 `VIDEO DONE` thong ke frame, bbox, raw class ID cua model sleep/raisehand, nhan
 cuoi cung va so crop classification da luu/bo. Neu `--raisehand-positive-id`
 khong ton tai trong model, script in canh bao ngay.
+
+Model raise-hand dung raw class `0=normal`, `1=raisehand`. Khi tao dataset, raw
+class `1` duoc anh xa thanh class YOLO `2=raisehand`.
