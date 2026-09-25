@@ -20,11 +20,8 @@ from build_detect_classify_datasets import (
     unique_path,
     yolo_line,
 )
-from yolov5_drowsiness import YoloV5DrowsinessDetector
-
-
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SLEEP_MODEL = ROOT / "videos" / "drowsiness_yolov5_best.onnx"
+DEFAULT_SLEEP_MODEL = ROOT / "runs" / "runs" / "model_ngu_gat" / "weights" / "best.pt"
 DEFAULT_RAISE_MODEL = ROOT / "videos" / "classroom_behavior_yolov8x_fold0_best.pt"
 DEFAULT_PERSON_MODEL = ROOT / "videos" / "human_detection_2class.pt"
 COLORS = {"normal": (60, 180, 75), "sleep": (30, 80, 230), "raisehand": (0, 200, 255)}
@@ -37,14 +34,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("sources", type=Path, nargs="+")
     parser.add_argument("--person-model", type=Path, default=DEFAULT_PERSON_MODEL)
-    parser.add_argument("--sleep-model", type=Path, default=DEFAULT_SLEEP_MODEL)
+    parser.add_argument(
+        "--sleep-model", type=Path, default=DEFAULT_SLEEP_MODEL,
+        help="Ultralytics classification model with class 0=normal, 1=sleep.",
+    )
     parser.add_argument("--raisehand-model", type=Path, default=DEFAULT_RAISE_MODEL)
     parser.add_argument("--output", type=Path, default=ROOT / "runs" / "behavior_predict")
+    parser.add_argument(
+        "--mode", choices=("all", "person", "sleep", "raisehand"), default="all",
+        help="Run all models or test one detector only.",
+    )
     parser.add_argument("--device", default=None, help="Ultralytics device: 0 or cpu")
     parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--sleep-imgsz", type=int, default=224)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--person-conf", type=float, default=0.25)
-    parser.add_argument("--sleep-conf", type=float, default=0.5)
+    parser.add_argument("--sleep-conf", type=float, default=0.8)
+    parser.add_argument("--sleep-positive-id", type=int, default=1)
     parser.add_argument("--raisehand-conf", type=float, default=0.5)
     parser.add_argument("--iou", type=float, default=0.45)
     parser.add_argument("--visible-class", default="visible-person")
@@ -59,11 +65,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def draw(image, box, label: str, raw_name: str, confidence: float) -> None:
+def draw(image, box, model_name: str, label: str, raw_name: str, confidence: float) -> None:
     x1, y1, x2, y2 = box
     color = COLORS[label]
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-    text = f"{label} [{raw_name}] {confidence:.2f}"
+    tag = {
+        "person": "PERSON", "sleep_classifier": "SLEEP-CLS",
+        "raisehand": "RAISEHAND",
+    }[model_name]
+    text = f"[{tag}] {label} [{raw_name}] {confidence:.2f}"
     (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
     cv2.rectangle(image, (x1, max(0, y1 - text_h - 8)), (x1 + text_w + 6, y1), color, -1)
     cv2.putText(image, text, (x1 + 3, max(text_h, y1 - 5)),
@@ -92,7 +102,13 @@ def main(args: argparse.Namespace) -> int:
         raise SystemExit("No input images or videos found.")
     if args.frame_stride < 1:
         raise SystemExit("--frame-stride must be at least 1.")
-    for model_path in (args.person_model, args.sleep_model, args.raisehand_model):
+    required_models = {
+        "all": (args.person_model, args.sleep_model, args.raisehand_model),
+        "person": (args.person_model,),
+        "sleep": (args.person_model, args.sleep_model),
+        "raisehand": (args.raisehand_model,),
+    }[args.mode]
+    for model_path in required_models:
         if not model_path.resolve().is_file():
             raise SystemExit(f"Model not found: {model_path.resolve()}")
 
@@ -108,15 +124,22 @@ def main(args: argparse.Namespace) -> int:
     if args.save_video:
         videos_root.mkdir(parents=True, exist_ok=True)
 
-    person_model = YOLO(str(args.person_model.resolve()))
-    sleep_model = YoloV5DrowsinessDetector(args.sleep_model.resolve(), args.device, args.imgsz)
-    raise_model = YOLO(str(args.raisehand_model.resolve()))
-    visible_ids = resolve_visible_ids(person_model.names, args.visible_class)
-    if not visible_ids:
+    person_model = (
+        YOLO(str(args.person_model.resolve()))
+        if args.mode in {"all", "person", "sleep"} else None
+    )
+    sleep_model = YOLO(str(args.sleep_model.resolve())) if args.mode in {"all", "sleep"} else None
+    raise_model = YOLO(str(args.raisehand_model.resolve())) if args.mode in {"all", "raisehand"} else None
+    visible_ids = resolve_visible_ids(person_model.names, args.visible_class) if person_model else set()
+    if person_model and not visible_ids:
         raise SystemExit(f"Visible class not found in person model names: {person_model.names}")
-    print(f"Person model: {args.person_model.resolve()} | names={person_model.names}")
-    print(f"Sleep model: {args.sleep_model.resolve()}")
-    print(f"Raise-hand model: {args.raisehand_model.resolve()} | names={raise_model.names}")
+    print(f"Mode: {args.mode}")
+    if person_model:
+        print(f"[PERSON] {args.person_model.resolve()} | names={person_model.names}")
+    if sleep_model:
+        print(f"[SLEEP-CLS] {args.sleep_model.resolve()} | names={sleep_model.names}")
+    if raise_model:
+        print(f"[RAISEHAND] {args.raisehand_model.resolve()} | names={raise_model.names}")
 
     rows = []
     counts = Counter()
@@ -147,22 +170,13 @@ def main(args: argparse.Namespace) -> int:
         height, width = image.shape[:2]
         stem = source.stem if source.suffix.lower() in IMAGE_EXTENSIONS else f"{source.stem}_{frame_index:08d}"
         events = []
-
-        for prediction in sleep_model.predict_all(image, args.sleep_conf, args.iou):
-            if prediction.class_id not in {1, 2, 3}:
-                continue
-            events.append(("drowsiness", prediction.class_id, prediction.class_name,
-                           prediction.confidence, "sleep", prediction.box))
-            log(
-                f"  frame={frame_index} SLEEP raw={prediction.class_name} "
-                f"conf={prediction.confidence:.3f} box={prediction.box}"
-            )
+        sleep_test_detections = []
 
         result = raise_model.predict(
             source=image, imgsz=args.imgsz, conf=args.raisehand_conf, iou=args.iou,
             device=args.device, classes=[0], verbose=False,
-        )[0]
-        if result.boxes is not None:
+        )[0] if raise_model else None
+        if result is not None and result.boxes is not None:
             for box, confidence, class_id in zip(
                 result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy(),
                 result.boxes.cls.cpu().numpy().astype(int),
@@ -175,16 +189,16 @@ def main(args: argparse.Namespace) -> int:
                     events.append(("raisehand", class_id, str(raise_model.names[class_id]),
                                    float(confidence), "raisehand", clipped))
                     log(
-                        f"  frame={frame_index} RAISEHAND raw={raise_model.names[class_id]} "
+                        f"  frame={frame_index} [RAISEHAND] raw={raise_model.names[class_id]} "
                         f"conf={float(confidence):.3f} box={clipped}"
                     )
 
         person_result = person_model.predict(
             source=image, imgsz=args.imgsz, conf=args.person_conf, iou=args.iou,
             device=args.device, classes=sorted(visible_ids), verbose=False,
-        )[0]
+        )[0] if person_model else None
         people = []
-        if person_result.boxes is not None:
+        if person_result is not None and person_result.boxes is not None:
             for person_index, (raw_person_box, person_confidence) in enumerate(zip(
                 person_result.boxes.xyxy.cpu().numpy(),
                 person_result.boxes.conf.cpu().numpy(),
@@ -194,39 +208,76 @@ def main(args: argparse.Namespace) -> int:
                     continue
                 people.append((person_box, float(person_confidence)))
                 log(
-                    f"  frame={frame_index} PERSON id={len(people)} "
+                    f"  frame={frame_index} [PERSON] id={len(people)} "
                     f"conf={float(person_confidence):.3f} box={person_box}"
                 )
 
-        events_by_person: dict[int, list[tuple]] = {index: [] for index in range(len(people))}
-        for event in events:
-            scores = [intersection_over_box(event[5], person[0]) for person in people]
-            best_person = max(range(len(scores)), key=scores.__getitem__) if scores else None
-            if best_person is not None and scores[best_person] >= 0.5:
-                events_by_person[best_person].append(event)
+        if sleep_model:
+            for person_index, (person_box, _) in enumerate(people, 1):
+                x1, y1, x2, y2 = person_box
+                crop = image[y1:y2, x1:x2]
+                cls_result = sleep_model.predict(
+                    source=crop, imgsz=args.sleep_imgsz, device=args.device, verbose=False
+                )[0]
+                if cls_result.probs is None:
+                    raise RuntimeError("Sleep model is not a classification model.")
+                raw_id = int(cls_result.probs.top1)
+                confidence = float(cls_result.probs.top1conf)
+                raw_name = str(sleep_model.names[raw_id])
                 log(
-                    f"  frame={frame_index} MATCH {event[4]} box={event[5]} "
-                    f"-> person={best_person + 1} overlap={scores[best_person]:.3f}"
+                    f"  frame={frame_index} [SLEEP-CLS] person={person_index} "
+                    f"raw_id={raw_id} raw={raw_name} conf={confidence:.3f} "
+                    f"person_box={person_box}"
                 )
-            else:
-                log(
-                    f"  frame={frame_index} UNMATCHED {event[4]} box={event[5]} "
-                    f"best_overlap={max(scores, default=0.0):.3f}"
-                )
+                if args.mode == "sleep":
+                    test_label = (
+                        "sleep"
+                        if raw_id == args.sleep_positive_id and confidence >= args.sleep_conf
+                        else "normal"
+                    )
+                    sleep_test_detections.append(
+                        ("sleep_classifier", raw_id, raw_name, confidence,
+                         test_label, person_box)
+                    )
+                if raw_id == args.sleep_positive_id and confidence >= args.sleep_conf:
+                    events.append(
+                        ("sleep_classifier", raw_id, raw_name, confidence, "sleep", person_box)
+                    )
 
         detections = []
-        for person_index, (person_box, person_confidence) in enumerate(people):
-            matched_events = events_by_person[person_index]
-            if matched_events:
-                for event in matched_events:
-                    model_name, raw_id, raw_name, confidence, label, event_box = event
-                    detections.append(
-                        (model_name, raw_id, raw_name, confidence, label, event_box)
+        if args.mode == "all":
+            events_by_person: dict[int, list[tuple]] = {index: [] for index in range(len(people))}
+            for event in events:
+                scores = [intersection_over_box(event[5], person[0]) for person in people]
+                best_person = max(range(len(scores)), key=scores.__getitem__) if scores else None
+                if best_person is not None and scores[best_person] >= 0.5:
+                    events_by_person[best_person].append(event)
+                    log(
+                        f"  frame={frame_index} [MATCH] {event[4]} box={event[5]} "
+                        f"-> person={best_person + 1} overlap={scores[best_person]:.3f}"
                     )
-            elif not args.exclude_normal:
-                detections.append(
-                    ("person", -1, "visible-person", person_confidence, "normal", person_box)
-                )
+                else:
+                    log(
+                        f"  frame={frame_index} [UNMATCHED] {event[4]} box={event[5]} "
+                        f"best_overlap={max(scores, default=0.0):.3f}"
+                    )
+            for person_index, (person_box, person_confidence) in enumerate(people):
+                matched_events = events_by_person[person_index]
+                if matched_events:
+                    detections.extend(matched_events)
+                elif not args.exclude_normal:
+                    detections.append(
+                        ("person", -1, "visible-person", person_confidence, "normal", person_box)
+                    )
+        elif args.mode == "person":
+            detections = [
+                ("person", -1, "visible-person", confidence, "normal", box)
+                for box, confidence in people
+            ]
+        elif args.mode == "sleep":
+            detections = sleep_test_detections
+        else:
+            detections = events
 
         annotated = image.copy()
         yolo_lines = []
@@ -236,11 +287,11 @@ def main(args: argparse.Namespace) -> int:
             x1, y1, x2, y2 = box
             cv2.imwrite(str(crop_path), image[y1:y2, x1:x2])
             yolo_lines.append(yolo_line(class_id, box, width, height))
-            draw(annotated, box, label, raw_name, confidence)
+            draw(annotated, box, model_name, label, raw_name, confidence)
             counts[label] += 1
             source_counts[label] += 1
             log(
-                f"  frame={frame_index} OUTPUT label={label} class={class_id} "
+                f"  frame={frame_index} [OUTPUT:{model_name.upper()}] label={label} class={class_id} "
                 f"model={model_name} raw={raw_name} conf={confidence:.3f} box={box}"
             )
             rows.append({
