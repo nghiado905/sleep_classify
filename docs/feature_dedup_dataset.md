@@ -49,3 +49,8 @@ va cosine similarity de kiem tra.
 `frames.csv` co mot dong cho moi anh YOLO, gom ten frame, file label, so object,
 danh sach class va thong ke `normal/sleep/raisehand`. `metadata.csv` van luu chi
 tiet tung bbox va tung crop classification.
+
+Khi bat dau, script in duong dan va `names` cua ca ba model. Sau moi video, log
+`VIDEO DONE` thong ke frame, bbox, raw class ID cua model sleep/raisehand, nhan
+cuoi cung va so crop classification da luu/bo. Neu `--raisehand-positive-id`
+khong ton tai trong model, script in canh bao ngay.

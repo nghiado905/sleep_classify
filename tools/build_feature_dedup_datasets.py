@@ -147,6 +147,34 @@ def find_crop_track(
     return track if best_iou >= iou_threshold else None
 
 
+def print_video_summary(source_path: Path, stats: Counter) -> None:
+    sleep_raw = {
+        int(key.removeprefix("sleep_raw_")): value
+        for key, value in stats.items() if key.startswith("sleep_raw_")
+    }
+    raisehand_raw = {
+        int(key.removeprefix("raisehand_raw_")): value
+        for key, value in stats.items() if key.startswith("raisehand_raw_")
+    }
+    tqdm.write("-" * 72)
+    tqdm.write(f"VIDEO DONE: {source_path.name}")
+    tqdm.write(
+        f"  frames processed={stats['frames_processed']:,}, "
+        f"YOLO frames saved={stats['yolo_frames_saved']:,}, "
+        f"visible-person boxes={stats['visible_boxes']:,}"
+    )
+    tqdm.write(f"  sleep model raw IDs: {sleep_raw}")
+    tqdm.write(f"  raisehand model raw IDs: {raisehand_raw}")
+    tqdm.write(
+        f"  final labels: normal={stats['label_normal']:,}, "
+        f"sleep={stats['label_sleep']:,}, raisehand={stats['label_raisehand']:,}"
+    )
+    tqdm.write(
+        f"  CLS crops saved={stats['cls_saved']:,}, "
+        f"similar crops skipped={stats['cls_skipped']:,}"
+    )
+
+
 def run(args: argparse.Namespace) -> int:
     from ultralytics import YOLO
 
@@ -183,6 +211,20 @@ def run(args: argparse.Namespace) -> int:
 
     yolo_root, cls_root = prepare_output(output, args.skip_existing, args.visualize)
     det_model, sleep_model, raisehand_model = [YOLO(str(path)) for path in model_paths]
+    print(f"Detector: {model_paths[0]} | names={det_model.names}")
+    print(f"Sleep classifier: {model_paths[1]} | names={sleep_model.names}")
+    print(f"Raisehand classifier: {model_paths[2]} | names={raisehand_model.names}")
+    raisehand_class_ids = (
+        set(raisehand_model.names)
+        if isinstance(raisehand_model.names, dict)
+        else set(range(len(raisehand_model.names)))
+    )
+    if args.raisehand_positive_id not in raisehand_class_ids:
+        print(
+            f"[WARNING] raisehand-positive-id={args.raisehand_positive_id} is not in "
+            f"raisehand model names {raisehand_model.names}",
+            file=sys.stderr,
+        )
     feature_device = resolve_torch_device(args.device)
     if feature_device.type == "cuda" and not torch.cuda.is_available():
         print("[ERROR] CUDA was requested but PyTorch cannot access a GPU.", file=sys.stderr)
@@ -195,11 +237,20 @@ def run(args: argparse.Namespace) -> int:
 
     tracks_by_source: dict[Path, list[CropTrack]] = {}
     counters, skipped, rows, frame_rows = Counter(), Counter(), [], []
+    current_source: Path | None = None
+    video_stats = Counter()
     started_at = time.perf_counter()
 
     for source_path, frame_index, fps, image in tqdm(
         iter_frames(inputs, args.frame_stride), desc="Frames"
     ):
+        if current_source != source_path:
+            if current_source is not None:
+                print_video_summary(current_source, video_stats)
+            current_source = source_path
+            video_stats = Counter()
+            tqdm.write(f"VIDEO START: {source_path}")
+        video_stats["frames_processed"] += 1
         height, width = image.shape[:2]
         result = det_model.predict(
             source=image, imgsz=args.det_imgsz, conf=args.conf, iou=args.iou,
@@ -225,12 +276,16 @@ def run(args: argparse.Namespace) -> int:
 
             sleep_id, sleep_conf = classify(sleep_model, crop, args.cls_imgsz, args.device)
             raise_id, raise_conf = classify(raisehand_model, crop, args.cls_imgsz, args.device)
+            video_stats[f"sleep_raw_{sleep_id}"] += 1
+            video_stats[f"raisehand_raw_{raise_id}"] += 1
+            video_stats["visible_boxes"] += 1
             if raise_id == args.raisehand_positive_id:
                 label, label_confidence = "raisehand", raise_conf
             elif sleep_id == args.sleep_positive_id:
                 label, label_confidence = "sleep", sleep_conf
             else:
                 label, label_confidence = "normal", min(sleep_conf, raise_conf)
+            video_stats[f"label_{label}"] += 1
             detections.append({
                 "box_index": box_index, "box": box, "crop": crop, "label": label,
                 "label_confidence": label_confidence, "sleep_id": sleep_id,
@@ -312,8 +367,10 @@ def run(args: argparse.Namespace) -> int:
                 cv2.imwrite(str(crop_path), crop)
                 track.saved_features.append(feature)
                 counters[label] += 1
+                video_stats["cls_saved"] += 1
             else:
                 skipped["similar_crop"] += 1
+                video_stats["cls_skipped"] += 1
             if visualized is not None:
                 draw_prediction(visualized, box, label, item["label_confidence"])
             x1, y1, x2, y2 = box
@@ -351,6 +408,10 @@ def run(args: argparse.Namespace) -> int:
             "sleep_count": frame_label_counts["sleep"],
             "raisehand_count": frame_label_counts["raisehand"],
         })
+        video_stats["yolo_frames_saved"] += 1
+
+    if current_source is not None:
+        print_video_summary(current_source, video_stats)
 
     fieldnames = [
         "source", "frame_index", "crop_saved", "sample_reason", "nearest_similarity",
