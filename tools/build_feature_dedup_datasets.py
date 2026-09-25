@@ -1,8 +1,4 @@
-"""Build diverse datasets by filtering similar frames with MobileNet embeddings.
-
-The filter works at frame level. A selected frame always keeps every detected
-person, so its YOLO label file remains complete.
-"""
+"""Build complete YOLO data and MobileNet-deduplicated classification crops."""
 
 from __future__ import annotations
 
@@ -11,6 +7,7 @@ import csv
 import sys
 import time
 from collections import Counter, deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -42,9 +39,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = PROJECT_ROOT / "datasets" / "feature_diverse"
 
 
+@dataclass
+class CropTrack:
+    box: tuple[int, int, int, int]
+    label: str
+    last_seen_frame: int
+    saved_features: deque[np.ndarray] = field(default_factory=deque)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create complete YOLO frames while filtering visually similar frames."
+        description="Keep complete YOLO frames and filter similar classification crops."
     )
     parser.add_argument(
         "sources", type=Path, nargs="+",
@@ -65,16 +70,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-stride", type=int, default=3)
     parser.add_argument(
         "--similarity-threshold", type=float, default=0.985,
-        help="Skip frame when cosine similarity is at least this value.",
+        help="Skip a classification crop when cosine similarity is at least this value.",
     )
     parser.add_argument(
         "--feature-history", type=int, default=100,
-        help="Number of recently saved frames used for comparison.",
+        help="Number of saved crop features kept for each tracked person.",
     )
     parser.add_argument(
         "--uncertain-confidence", type=float, default=0.7,
-        help="Always save a frame containing a prediction below this confidence.",
+        help="Always save a classification crop below this confidence.",
     )
+    parser.add_argument("--track-iou", type=float, default=0.3)
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
@@ -98,7 +104,7 @@ def load_feature_model(device: torch.device):
     return model, weights.transforms()
 
 
-def extract_frame_feature(
+def extract_crop_feature(
     image: np.ndarray,
     model: torch.nn.Module,
     preprocess,
@@ -115,34 +121,30 @@ def extract_frame_feature(
     return embedding[0].cpu().numpy().astype(np.float32)
 
 
-def layout_signature(
-    detections: list[dict], width: int, height: int
-) -> tuple[tuple[str, int, int, int, int], ...]:
-    """Describe labels and coarse locations so class/layout changes are preserved."""
-    signature = []
-    for detection in detections:
-        x1, y1, x2, y2 = detection["box"]
-        signature.append((
-            detection["label"],
-            round(((x1 + x2) / 2) / width * 20),
-            round(((y1 + y2) / 2) / height * 20),
-            round((x2 - x1) / width * 20),
-            round((y2 - y1) / height * 20),
-        ))
-    return tuple(sorted(signature))
+def box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0 else 0.0
 
 
-def nearest_similarity(
-    feature: np.ndarray,
-    signature: tuple,
-    history: deque[tuple[np.ndarray, tuple]],
-) -> float | None:
-    similarities = [
-        float(np.dot(feature, old_feature))
-        for old_feature, old_signature in history
-        if old_signature == signature
+def find_crop_track(
+    tracks: list[CropTrack], box: tuple[int, int, int, int], frame_index: int,
+    max_age_frames: int, iou_threshold: float, used_ids: set[int],
+) -> CropTrack | None:
+    candidates = [
+        (box_iou(track.box, box), track)
+        for track in tracks
+        if frame_index - track.last_seen_frame <= max_age_frames
+        and id(track) not in used_ids
     ]
-    return max(similarities) if similarities else None
+    if not candidates:
+        return None
+    best_iou, track = max(candidates, key=lambda item: item[0])
+    return track if best_iou >= iou_threshold else None
 
 
 def run(args: argparse.Namespace) -> int:
@@ -151,8 +153,8 @@ def run(args: argparse.Namespace) -> int:
     if args.frame_stride < 1 or args.feature_history < 1:
         print("[ERROR] frame-stride and feature-history must be >= 1", file=sys.stderr)
         return 1
-    if not 0 <= args.similarity_threshold <= 1:
-        print("[ERROR] similarity-threshold must be between 0 and 1", file=sys.stderr)
+    if not 0 <= args.similarity_threshold <= 1 or not 0 <= args.track_iou <= 1:
+        print("[ERROR] similarity-threshold and track-iou must be between 0 and 1", file=sys.stderr)
         return 1
 
     output = args.output.resolve()
@@ -191,11 +193,11 @@ def run(args: argparse.Namespace) -> int:
         print(f"[ERROR] Visible class not found in {det_model.names}", file=sys.stderr)
         return 1
 
-    histories: dict[Path, deque[tuple[np.ndarray, tuple]]] = {}
-    counters, skipped, rows = Counter(), Counter(), []
+    tracks_by_source: dict[Path, list[CropTrack]] = {}
+    counters, skipped, rows, frame_rows = Counter(), Counter(), [], []
     started_at = time.perf_counter()
 
-    for source_path, frame_index, _, image in tqdm(
+    for source_path, frame_index, fps, image in tqdm(
         iter_frames(inputs, args.frame_stride), desc="Frames"
     ):
         height, width = image.shape[:2]
@@ -239,27 +241,6 @@ def run(args: argparse.Namespace) -> int:
             skipped["no_visible_person"] += 1
             continue
 
-        feature = extract_frame_feature(
-            image, feature_model, feature_preprocess, feature_device
-        )
-        signature = layout_signature(detections, width, height)
-        history = histories.setdefault(
-            source_path, deque(maxlen=args.feature_history)
-        )
-        similarity = nearest_similarity(feature, signature, history)
-        uncertain = any(
-            item["label_confidence"] < args.uncertain_confidence for item in detections
-        )
-        if similarity is not None and similarity >= args.similarity_threshold and not uncertain:
-            skipped["similar_frame"] += 1
-            continue
-
-        reason = (
-            "uncertain" if uncertain
-            else "new_layout" if similarity is None
-            else "visual_change"
-        )
-        history.append((feature, signature))
         frame_stem = (
             source_path.stem if source_path.suffix.lower() in IMAGE_EXTENSIONS
             else f"{source_path.stem}_{frame_index:08d}"
@@ -268,6 +249,13 @@ def run(args: argparse.Namespace) -> int:
         label_output = yolo_root / "labels" / f"{image_output.stem}.txt"
         visualized = image.copy() if args.visualize else None
         lines = []
+        tracks = tracks_by_source.setdefault(source_path, [])
+        max_track_age = max(1, int(round(fps * 3.0)))
+        tracks[:] = [
+            track for track in tracks
+            if frame_index - track.last_seen_frame <= max_track_age
+        ]
+        used_track_ids: set[int] = set()
 
         for item in detections:
             box_index, box, crop = item["box_index"], item["box"], item["crop"]
@@ -275,19 +263,67 @@ def run(args: argparse.Namespace) -> int:
             class_id = CLASS_TO_ID[label]
             line = yolo_line(class_id, box, width, height)
             lines.append(line)
-            crop_path = unique_path(
-                cls_root / label, f"{frame_stem}_box{box_index:03d}_{label}", ".jpg"
+            feature = extract_crop_feature(
+                crop, feature_model, feature_preprocess, feature_device
             )
-            cv2.imwrite(str(crop_path), crop)
+            track = find_crop_track(
+                tracks, box, frame_index, max_track_age, args.track_iou, used_track_ids
+            )
+            label_changed = track is not None and track.label != label
+            if track is None:
+                track = CropTrack(
+                    box, label, frame_index, deque(maxlen=args.feature_history)
+                )
+                tracks.append(track)
+                similarity = None
+                save_crop = True
+                reason = "new_person"
+            else:
+                if label_changed:
+                    track.saved_features.clear()
+                similarities = [
+                    float(np.dot(feature, old_feature))
+                    for old_feature in track.saved_features
+                ]
+                similarity = max(similarities) if similarities else None
+                uncertain = item["label_confidence"] < args.uncertain_confidence
+                save_crop = (
+                    label_changed
+                    or uncertain
+                    or similarity is None
+                    or similarity < args.similarity_threshold
+                )
+                reason = (
+                    "label_changed" if label_changed
+                    else "uncertain" if uncertain
+                    else "visual_change" if save_crop
+                    else "similar_crop"
+                )
+                track.box = box
+                track.label = label
+                track.last_seen_frame = frame_index
+            used_track_ids.add(id(track))
+
+            crop_path = None
+            if save_crop:
+                crop_path = unique_path(
+                    cls_root / label, f"{frame_stem}_box{box_index:03d}_{label}", ".jpg"
+                )
+                cv2.imwrite(str(crop_path), crop)
+                track.saved_features.append(feature)
+                counters[label] += 1
+            else:
+                skipped["similar_crop"] += 1
             if visualized is not None:
                 draw_prediction(visualized, box, label, item["label_confidence"])
-            counters[label] += 1
             x1, y1, x2, y2 = box
             rows.append({
                 "source": str(source_path), "frame_index": frame_index,
-                "sample_reason": reason, "nearest_similarity": "" if similarity is None
+                "crop_saved": int(save_crop), "sample_reason": reason,
+                "nearest_similarity": "" if similarity is None
                 else f"{similarity:.6f}", "yolo_image": str(image_output),
-                "yolo_label": str(label_output), "crop": str(crop_path),
+                "yolo_label": str(label_output),
+                "crop": "" if crop_path is None else str(crop_path),
                 "label": label, "class_id": class_id,
                 "sleep_raw_id": item["sleep_id"],
                 "sleep_confidence": f"{item['sleep_conf']:.6f}",
@@ -300,9 +336,24 @@ def run(args: argparse.Namespace) -> int:
         label_output.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if visualized is not None:
             cv2.imwrite(str(output / "visualize" / image_output.name), visualized)
+        frame_label_counts = Counter(item["label"] for item in detections)
+        frame_rows.append({
+            "source_video": str(source_path),
+            "frame_index": frame_index,
+            "image_name": image_output.name,
+            "image_path": str(image_output),
+            "label_name": label_output.name,
+            "label_path": str(label_output),
+            "object_count": len(detections),
+            "class_ids": " ".join(str(CLASS_TO_ID[item["label"]]) for item in detections),
+            "class_names": " ".join(item["label"] for item in detections),
+            "normal_count": frame_label_counts["normal"],
+            "sleep_count": frame_label_counts["sleep"],
+            "raisehand_count": frame_label_counts["raisehand"],
+        })
 
     fieldnames = [
-        "source", "frame_index", "sample_reason", "nearest_similarity",
+        "source", "frame_index", "crop_saved", "sample_reason", "nearest_similarity",
         "yolo_image", "yolo_label", "crop", "label", "class_id",
         "sleep_raw_id", "sleep_confidence", "raisehand_raw_id",
         "raisehand_confidence", "yolo_line", "x1", "y1", "x2", "y2",
@@ -312,11 +363,21 @@ def run(args: argparse.Namespace) -> int:
         writer.writeheader()
         writer.writerows(rows)
 
+    frame_fields = [
+        "source_video", "frame_index", "image_name", "image_path", "label_name",
+        "label_path", "object_count", "class_ids", "class_names", "normal_count",
+        "sleep_count", "raisehand_count",
+    ]
+    with (output / "frames.csv").open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=frame_fields)
+        writer.writeheader()
+        writer.writerows(frame_rows)
+
     print(
         f"DONE: normal={counters['normal']:,}, sleep={counters['sleep']:,}, "
         f"raisehand={counters['raisehand']:,}, total={sum(counters.values()):,}"
     )
-    print(f"Skipped similar frames: {skipped['similar_frame']:,}")
+    print(f"Skipped similar classification crops: {skipped['similar_crop']:,}")
     print(f"Output: {output}")
     print(f"Time: {time.perf_counter() - started_at:.2f}s")
     return 0

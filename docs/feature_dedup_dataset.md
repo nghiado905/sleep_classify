@@ -1,12 +1,14 @@
 # MobileNet feature dedup dataset
 
 Script `tools/build_feature_dedup_datasets.py` dung MobileNetV3-Small pretrained
-de trich embedding cua toan frame va cosine similarity de loai frame gan trung.
+de trich embedding cua tung crop nguoi va cosine similarity de loai crop gan trung.
 
 ```text
-frame -> detect/classify tat ca nguoi -> MobileNet embedding
-      -> so voi cac frame da luu co cung chu ky bbox/nhan
-      -> neu khac: luu anh + tat ca bbox + tat ca crop
+frame -> detect/classify tat ca nguoi
+      -> dataset_yolo: luu anh + tat ca bbox
+      -> dataset_cls: MobileNet embedding tung crop
+                    -> ghep hoc sinh bang IoU bbox
+                    -> chi luu crop moi/khac
 ```
 
 Lenh mau:
@@ -39,5 +41,11 @@ Nguong cao hon se giu nhieu frame hon:
 - `0.985`: mac dinh
 - `0.970`: loc manh
 
-Frame co bo cuc bbox/nhan thay doi hoac co confidence thap luon duoc giu. Khi mot
-frame duoc giu, file YOLO chua day du moi bbox `visible-person` cua frame do.
+`dataset_yolo` khong bi loc boi MobileNet: moi frame co nguoi va tat ca bbox deu
+duoc luu. Chi `dataset_cls` bo crop gan trung cua cung hoc sinh. Crop co nhan thay
+doi hoac confidence thap luon duoc giu. `metadata.csv` co `crop_saved=1/0`, ly do
+va cosine similarity de kiem tra.
+
+`frames.csv` co mot dong cho moi anh YOLO, gom ten frame, file label, so object,
+danh sach class va thong ke `normal/sleep/raisehand`. `metadata.csv` van luu chi
+tiet tung bbox va tung crop classification.
