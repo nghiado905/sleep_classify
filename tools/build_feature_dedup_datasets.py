@@ -70,6 +70,18 @@ def parse_args() -> argparse.Namespace:
         "--raisehand-positive-id", type=int, default=1,
         help="Raw positive class ID returned by the raise-hand classifier. Default: 1",
     )
+    parser.add_argument(
+        "--raisehand-normal-id", type=int, default=0,
+        help="Raw normal class ID required before assigning sleep. Default: 0",
+    )
+    parser.add_argument(
+        "--sleep-conf-threshold", type=float, default=0.8,
+        help="Minimum confidence required to assign sleep. Default: 0.8",
+    )
+    parser.add_argument(
+        "--raisehand-conf-threshold", type=float, default=0.8,
+        help="Minimum confidence required to assign raisehand. Default: 0.8",
+    )
     parser.add_argument("--frame-stride", type=int, default=3)
     parser.add_argument(
         "--similarity-threshold", type=float, default=0.985,
@@ -168,6 +180,14 @@ def print_video_summary(source_path: Path, stats: Counter) -> None:
     )
     tqdm.write(f"  sleep model raw IDs: {sleep_raw}")
     tqdm.write(f"  raisehand model raw IDs: {raisehand_raw}")
+    positive_count = stats["raisehand_positive_count"]
+    if positive_count:
+        tqdm.write(
+            f"  raisehand raw=1 confidence: "
+            f"min={stats['raisehand_positive_min']:.3f}, "
+            f"avg={stats['raisehand_positive_sum'] / positive_count:.3f}, "
+            f"max={stats['raisehand_positive_max']:.3f}"
+        )
     tqdm.write(
         f"  final labels: normal={stats['label_normal']:,}, "
         f"sleep={stats['label_sleep']:,}, raisehand={stats['label_raisehand']:,}"
@@ -184,8 +204,12 @@ def run(args: argparse.Namespace) -> int:
     if args.frame_stride < 1 or args.feature_history < 1:
         print("[ERROR] frame-stride and feature-history must be >= 1", file=sys.stderr)
         return 1
-    if not 0 <= args.similarity_threshold <= 1 or not 0 <= args.track_iou <= 1:
-        print("[ERROR] similarity-threshold and track-iou must be between 0 and 1", file=sys.stderr)
+    probability_values = (
+        args.similarity_threshold, args.track_iou, args.sleep_conf_threshold,
+        args.raisehand_conf_threshold, args.uncertain_confidence,
+    )
+    if not all(0 <= value <= 1 for value in probability_values):
+        print("[ERROR] Confidence, similarity and IoU values must be between 0 and 1", file=sys.stderr)
         return 1
 
     output = args.output.resolve()
@@ -281,13 +305,45 @@ def run(args: argparse.Namespace) -> int:
             raise_id, raise_conf = classify(raisehand_model, crop, args.cls_imgsz, args.device)
             video_stats[f"sleep_raw_{sleep_id}"] += 1
             video_stats[f"raisehand_raw_{raise_id}"] += 1
-            video_stats["visible_boxes"] += 1
             if raise_id == args.raisehand_positive_id:
+                video_stats["raisehand_positive_count"] += 1
+                video_stats["raisehand_positive_sum"] += raise_conf
+                if video_stats["raisehand_positive_count"] == 1:
+                    video_stats["raisehand_positive_min"] = raise_conf
+                else:
+                    video_stats["raisehand_positive_min"] = min(
+                        video_stats["raisehand_positive_min"], raise_conf
+                    )
+                video_stats["raisehand_positive_max"] = max(
+                    video_stats["raisehand_positive_max"], raise_conf
+                )
+            video_stats["visible_boxes"] += 1
+            if (
+                raise_id == args.raisehand_positive_id
+                and raise_conf >= args.raisehand_conf_threshold
+            ):
                 label, label_confidence = "raisehand", raise_conf
-            elif sleep_id == args.sleep_positive_id:
+            elif (
+                raise_id == args.raisehand_normal_id
+                and
+                sleep_id == args.sleep_positive_id
+                and sleep_conf >= args.sleep_conf_threshold
+            ):
                 label, label_confidence = "sleep", sleep_conf
             else:
-                label, label_confidence = "normal", min(sleep_conf, raise_conf)
+                rejected_positive = [
+                    confidence
+                    for raw_id, positive_id, confidence in (
+                        (sleep_id, args.sleep_positive_id, sleep_conf),
+                        (raise_id, args.raisehand_positive_id, raise_conf),
+                    )
+                    if raw_id == positive_id
+                ]
+                label = "normal"
+                label_confidence = (
+                    1.0 - max(rejected_positive)
+                    if rejected_positive else min(sleep_conf, raise_conf)
+                )
             video_stats[f"label_{label}"] += 1
             detections.append({
                 "box_index": box_index, "box": box, "crop": crop, "label": label,
@@ -394,7 +450,8 @@ def run(args: argparse.Namespace) -> int:
 
         cv2.imwrite(str(image_output), image)
         label_output.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        if visualized is not None:
+        has_event = any(item["label"] in {"sleep", "raisehand"} for item in detections)
+        if visualized is not None and has_event:
             cv2.imwrite(str(output / "visualize" / image_output.name), visualized)
         frame_label_counts = Counter(item["label"] for item in detections)
         frame_rows.append({

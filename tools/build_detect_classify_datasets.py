@@ -18,9 +18,9 @@ import numpy as np
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DETECT_MODEL = PROJECT_ROOT / "human_detection_2class.pt"
+DEFAULT_DETECT_MODEL = PROJECT_ROOT / "videos" / "human_detection_2class.pt"
 DEFAULT_SLEEP_MODEL = PROJECT_ROOT / "runs" / "runs" / "model_ngu_gat" / "weights" / "best.pt"
-DEFAULT_RAISEHAND_MODEL = PROJECT_ROOT / "classify_raisehand.pt"
+DEFAULT_RAISEHAND_MODEL = PROJECT_ROOT / "videos" / "classify_raisehand.pt"
 DEFAULT_OUTPUT = PROJECT_ROOT / "datasets" / "detect_classify_auto"
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
@@ -60,6 +60,9 @@ def parse_args() -> argparse.Namespace:
         "--raisehand-positive-id", type=int, default=1,
         help="Raw positive class ID returned by the raise-hand classifier. Default: 1",
     )
+    parser.add_argument("--raisehand-normal-id", type=int, default=0)
+    parser.add_argument("--sleep-conf-threshold", type=float, default=0.8)
+    parser.add_argument("--raisehand-conf-threshold", type=float, default=0.8)
     parser.add_argument(
         "--frame-stride", type=int, default=1,
         help="Process every Nth video frame. Default: 1",
@@ -249,6 +252,9 @@ def run(args: argparse.Namespace) -> int:
     if not 0 <= args.uncertain_confidence <= 1 or not 0 <= args.track_iou <= 1:
         print("[ERROR] Confidence and IoU values must be between 0 and 1", file=sys.stderr)
         return 1
+    if not 0 <= args.sleep_conf_threshold <= 1 or not 0 <= args.raisehand_conf_threshold <= 1:
+        print("[ERROR] Classifier confidence thresholds must be between 0 and 1", file=sys.stderr)
+        return 1
     source, output = args.source.resolve(), args.output.resolve()
     model_paths = {
         "detect": args.detect_model.resolve(), "sleep": args.sleep_model.resolve(),
@@ -324,15 +330,34 @@ def run(args: argparse.Namespace) -> int:
 
             sleep_id, sleep_conf = classify(sleep_model, crop, args.cls_imgsz, args.device)
             raise_id, raise_conf = classify(raisehand_model, crop, args.cls_imgsz, args.device)
-            if raise_id == args.raisehand_positive_id:
+            if (
+                raise_id == args.raisehand_positive_id
+                and raise_conf >= args.raisehand_conf_threshold
+            ):
                 label = "raisehand"
                 label_confidence = raise_conf
-            elif sleep_id == args.sleep_positive_id:
+            elif (
+                raise_id == args.raisehand_normal_id
+                and
+                sleep_id == args.sleep_positive_id
+                and sleep_conf >= args.sleep_conf_threshold
+            ):
                 label = "sleep"
                 label_confidence = sleep_conf
             else:
                 label = "normal"
-                label_confidence = min(raise_conf, sleep_conf)
+                rejected_positive = [
+                    confidence
+                    for raw_id, positive_id, confidence in (
+                        (sleep_id, args.sleep_positive_id, sleep_conf),
+                        (raise_id, args.raisehand_positive_id, raise_conf),
+                    )
+                    if raw_id == positive_id
+                ]
+                label_confidence = (
+                    1.0 - max(rejected_positive)
+                    if rejected_positive else min(raise_conf, sleep_conf)
+                )
 
             track = find_track(
                 tracks, box, frame_index, max_track_age, args.track_iou, used_track_ids
@@ -421,7 +446,10 @@ def run(args: argparse.Namespace) -> int:
             })
         cv2.imwrite(str(image_output), image)
         label_output.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        if visualized is not None:
+        has_event = any(
+            detection["label"] in {"sleep", "raisehand"} for detection in detections
+        )
+        if visualized is not None and has_event:
             cv2.imwrite(str(output / "visualize" / image_output.name), visualized)
 
     fieldnames = [

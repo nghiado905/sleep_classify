@@ -57,3 +57,12 @@ khong ton tai trong model, script in canh bao ngay.
 
 Model raise-hand dung raw class `0=normal`, `1=raisehand`. Khi tao dataset, raw
 class `1` duoc anh xa thanh class YOLO `2=raisehand`.
+
+Classifier chi gan nhan duong tinh khi dat nguong confidence. Mac dinh
+`--sleep-conf-threshold 0.8` va `--raisehand-conf-threshold 0.8`. Raise-hand van
+duoc uu tien neu ca hai model cung duong tinh va deu dat nguong.
+
+Quy tac fusion: raise-hand raw `1` dat nguong thanh YOLO `2`; chi khi raise-hand
+raw `0` thi sleep raw `1` dat nguong moi thanh YOLO `1`; con lai la normal.
+`--visualize` chi luu frame co it nhat mot `sleep` hoac `raisehand`, nhung anh do
+van ve day du tat ca bbox trong frame.
