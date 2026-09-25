@@ -10,6 +10,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -29,6 +30,14 @@ CLASS_COLORS = {
     "sleep": (30, 80, 230),
     "raisehand": (0, 200, 255),
 }
+
+
+@dataclass
+class TrackState:
+    box: tuple[int, int, int, int]
+    label: str
+    last_seen_frame: int
+    last_saved_frame: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +65,15 @@ def parse_args() -> argparse.Namespace:
         "--visualize", action="store_true",
         help="Save annotated frames with bounding boxes and predicted labels.",
     )
+    parser.add_argument(
+        "--adaptive-sampling", action="store_true",
+        help="Save stable normal/sleep/raisehand crops at different time intervals.",
+    )
+    parser.add_argument("--normal-seconds", type=float, default=5.0)
+    parser.add_argument("--sleep-seconds", type=float, default=1.0)
+    parser.add_argument("--raisehand-seconds", type=float, default=0.5)
+    parser.add_argument("--uncertain-confidence", type=float, default=0.7)
+    parser.add_argument("--track-iou", type=float, default=0.3)
     parser.add_argument("--skip-existing", action="store_true")
     return parser.parse_args()
 
@@ -71,22 +89,27 @@ def collect_inputs(source: Path) -> list[Path]:
     return []
 
 
-def iter_frames(inputs: list[Path], frame_stride: int) -> Iterator[tuple[Path, int, np.ndarray]]:
+def iter_frames(
+    inputs: list[Path], frame_stride: int
+) -> Iterator[tuple[Path, int, float, np.ndarray]]:
     for path in inputs:
         if path.suffix.lower() in IMAGE_EXTENSIONS:
             image = cv2.imread(str(path))
             if image is not None:
-                yield path, 0, image
+                yield path, 0, 1.0, image
             continue
 
         capture = cv2.VideoCapture(str(path))
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        if not np.isfinite(fps) or fps <= 0:
+            fps = 25.0
         frame_index = 0
         while capture.isOpened():
             ok, frame = capture.read()
             if not ok:
                 break
             if frame_index % frame_stride == 0:
-                yield path, frame_index, frame
+                yield path, frame_index, fps, frame
             frame_index += 1
         capture.release()
 
@@ -119,6 +142,36 @@ def yolo_line(class_id: int, box: tuple[int, int, int, int], width: int, height:
         f"{((y1 + y2) / 2) / height:.6f} "
         f"{(x2 - x1) / width:.6f} {(y2 - y1) / height:.6f}"
     )
+
+
+def box_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def find_track(
+    tracks: list[TrackState],
+    box: tuple[int, int, int, int],
+    frame_index: int,
+    max_age_frames: int,
+    iou_threshold: float,
+    used_track_ids: set[int],
+) -> TrackState | None:
+    candidates = [
+        (box_iou(track.box, box), track)
+        for track in tracks
+        if frame_index - track.last_seen_frame <= max_age_frames
+        and id(track) not in used_track_ids
+    ]
+    if not candidates:
+        return None
+    best_iou, best_track = max(candidates, key=lambda item: item[0])
+    return best_track if best_iou >= iou_threshold else None
 
 
 def unique_path(directory: Path, stem: str, suffix: str) -> Path:
@@ -187,6 +240,12 @@ def run(args: argparse.Namespace) -> int:
     if args.frame_stride < 1:
         print("[ERROR] --frame-stride must be >= 1", file=sys.stderr)
         return 1
+    if min(args.normal_seconds, args.sleep_seconds, args.raisehand_seconds) <= 0:
+        print("[ERROR] Adaptive sampling intervals must be > 0", file=sys.stderr)
+        return 1
+    if not 0 <= args.uncertain_confidence <= 1 or not 0 <= args.track_iou <= 1:
+        print("[ERROR] Confidence and IoU values must be between 0 and 1", file=sys.stderr)
+        return 1
     source, output = args.source.resolve(), args.output.resolve()
     model_paths = {
         "detect": args.detect_model.resolve(), "sleep": args.sleep_model.resolve(),
@@ -211,9 +270,15 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     counters, skipped, rows = Counter(), Counter(), []
+    tracks_by_source: dict[Path, list[TrackState]] = {}
+    sample_seconds = {
+        "normal": args.normal_seconds,
+        "sleep": args.sleep_seconds,
+        "raisehand": args.raisehand_seconds,
+    }
     started_at = time.perf_counter()
     frames = iter_frames(inputs, args.frame_stride)
-    for source_path, frame_index, image in tqdm(frames, desc="Frames"):
+    for source_path, frame_index, fps, image in tqdm(frames, desc="Frames"):
         height, width = image.shape[:2]
         result = det_model.predict(
             source=image, imgsz=args.det_imgsz, conf=args.conf, iou=args.iou,
@@ -231,6 +296,13 @@ def run(args: argparse.Namespace) -> int:
         label_output = yolo_root / "labels" / f"{image_output.stem}.txt"
         lines = []
         visualized = image.copy() if args.visualize else None
+        tracks = tracks_by_source.setdefault(source_path, [])
+        max_track_age = max(1, int(round(fps * 3.0)))
+        tracks[:] = [
+            track for track in tracks
+            if frame_index - track.last_seen_frame <= max_track_age
+        ]
+        used_track_ids: set[int] = set()
         classes = result.boxes.cls.cpu().numpy().astype(int)
         boxes = result.boxes.xyxy.cpu().numpy()
         for box_index, (det_class, raw_box) in enumerate(zip(classes, boxes), start=1):
@@ -257,7 +329,44 @@ def run(args: argparse.Namespace) -> int:
                 label_confidence = sleep_conf
             else:
                 label = "normal"
-                label_confidence = min(1.0 - raise_conf, 1.0 - sleep_conf)
+                label_confidence = min(raise_conf, sleep_conf)
+
+            track = find_track(
+                tracks, box, frame_index, max_track_age, args.track_iou, used_track_ids
+            )
+            label_changed = track is not None and track.label != label
+            is_uncertain = label_confidence < args.uncertain_confidence
+            if track is None:
+                track = TrackState(box, label, frame_index, frame_index)
+                tracks.append(track)
+                should_save = True
+                sample_reason = "new_person"
+            else:
+                interval_frames = max(1, int(round(sample_seconds[label] * fps)))
+                should_save = (
+                    not args.adaptive_sampling
+                    or label_changed
+                    or is_uncertain
+                    or frame_index - track.last_saved_frame >= interval_frames
+                )
+                if label_changed:
+                    sample_reason = "label_changed"
+                elif is_uncertain:
+                    sample_reason = "uncertain"
+                else:
+                    sample_reason = "interval"
+                track.box = box
+                track.label = label
+                track.last_seen_frame = frame_index
+            used_track_ids.add(id(track))
+
+            if not args.adaptive_sampling:
+                should_save = True
+                sample_reason = "all_frames"
+            if not should_save:
+                skipped[f"adaptive_{label}"] += 1
+                continue
+            track.last_saved_frame = frame_index
 
             class_id = CLASS_TO_ID[label]
             line = yolo_line(class_id, box, width, height)
@@ -271,6 +380,7 @@ def run(args: argparse.Namespace) -> int:
             counters[label] += 1
             rows.append({
                 "source": str(source_path), "frame_index": frame_index,
+                "sample_reason": sample_reason,
                 "yolo_image": str(image_output),
                 "yolo_label": str(label_output), "crop": str(crop_path),
                 "label": label, "class_id": class_id, "sleep_raw_id": sleep_id,
@@ -287,7 +397,7 @@ def run(args: argparse.Namespace) -> int:
             skipped["no_visible_person"] += 1
 
     fieldnames = [
-        "source", "frame_index", "yolo_image", "yolo_label", "crop",
+        "source", "frame_index", "sample_reason", "yolo_image", "yolo_label", "crop",
         "label", "class_id",
         "sleep_raw_id", "sleep_confidence", "raisehand_raw_id",
         "raisehand_confidence", "yolo_line", "x1", "y1", "x2", "y2",

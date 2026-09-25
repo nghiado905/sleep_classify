@@ -43,3 +43,16 @@ output/
 
 Frame video duoc dat ten theo mau `<ten_video>_<frame_index>.jpg`, vi du
 `camera01_00000015.jpg`. Dung `--visualize` de luu frame co bbox va nhan du doan.
+
+## Adaptive sampling
+
+Dung `--adaptive-sampling` de ghep nguoi giua cac frame bang IoU va luu theo chu ky:
+
+- `normal`: 5 giay
+- `sleep`: 1 giay
+- `raisehand`: 0.5 giay
+- Nguoi moi, nhan thay doi hoac confidence duoi 0.7: luu ngay
+
+Co the doi bang `--normal-seconds`, `--sleep-seconds`, `--raisehand-seconds`,
+`--uncertain-confidence` va `--track-iou`. Ly do chon crop nam trong cot
+`sample_reason` cua `metadata.csv`.
