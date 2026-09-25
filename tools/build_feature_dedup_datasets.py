@@ -46,7 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create complete YOLO frames while filtering visually similar frames."
     )
-    parser.add_argument("source", type=Path, help="Video/image file or folder")
+    parser.add_argument(
+        "sources", type=Path, nargs="+",
+        help="One or more video/image files or folders",
+    )
     parser.add_argument("--detect-model", type=Path, default=DEFAULT_DETECT_MODEL)
     parser.add_argument("--sleep-model", type=Path, default=DEFAULT_SLEEP_MODEL)
     parser.add_argument("--raisehand-model", type=Path, default=DEFAULT_RAISEHAND_MODEL)
@@ -152,7 +155,7 @@ def run(args: argparse.Namespace) -> int:
         print("[ERROR] similarity-threshold must be between 0 and 1", file=sys.stderr)
         return 1
 
-    source, output = args.source.resolve(), args.output.resolve()
+    output = args.output.resolve()
     model_paths = [
         args.detect_model.resolve(), args.sleep_model.resolve(),
         args.raisehand_model.resolve(),
@@ -161,10 +164,20 @@ def run(args: argparse.Namespace) -> int:
         if not model_path.is_file():
             print(f"[ERROR] Model not found: {model_path}", file=sys.stderr)
             return 1
-    inputs = collect_inputs(source)
+    inputs = []
+    seen_inputs: set[Path] = set()
+    for source in args.sources:
+        resolved_source = source.resolve()
+        for input_path in collect_inputs(resolved_source):
+            resolved_input = input_path.resolve()
+            if resolved_input not in seen_inputs:
+                seen_inputs.add(resolved_input)
+                inputs.append(resolved_input)
     if not inputs:
-        print(f"[ERROR] No valid videos or images found in: {source}", file=sys.stderr)
+        source_list = ", ".join(str(path) for path in args.sources)
+        print(f"[ERROR] No valid videos or images found in: {source_list}", file=sys.stderr)
         return 1
+    print(f"Found {len(inputs):,} input file(s).")
 
     yolo_root, cls_root = prepare_output(output, args.skip_existing, args.visualize)
     det_model, sleep_model, raisehand_model = [YOLO(str(path)) for path in model_paths]

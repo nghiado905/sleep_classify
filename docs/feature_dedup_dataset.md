@@ -15,6 +15,21 @@ Lenh mau:
 python tools\build_feature_dedup_datasets.py video.mp4 --device 0 --frame-stride 3 --similarity-threshold 0.985 --visualize
 ```
 
+Nhieu video trong mot lenh:
+
+```powershell
+python tools\build_feature_dedup_datasets.py video01.mp4 video02.mp4 video03.mp4 --device 0 --frame-stride 3 --visualize
+```
+
+Hoac truyen ca thu muc; script se tim video trong cac thu muc con:
+
+```powershell
+python tools\build_feature_dedup_datasets.py D:\videos_ca_sang D:\videos_ca_chieu --device 0 --frame-stride 3 --visualize
+```
+
+Moi model chi duoc nap mot lan. Cac video duoc xu ly lan luot tren cung GPU va ket
+qua duoc gop vao mot thu muc output, voi ten file bat dau bang ten video nguon.
+
 MobileNet va cac model YOLO dung chung thiet bi tu `--device`. Lan chay dau tien,
 torchvision co the tai weights pretrained neu weights chua nam trong cache.
 
