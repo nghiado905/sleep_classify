@@ -17,11 +17,12 @@ import torch.nn.functional as torch_functional
 from tqdm import tqdm
 from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
+from yolov5_drowsiness import YoloV5DrowsinessDetector
+
 from build_detect_classify_datasets import (
     CLASS_TO_ID,
     DEFAULT_DETECT_MODEL,
     DEFAULT_RAISEHAND_MODEL,
-    DEFAULT_SLEEP_MODEL,
     IMAGE_EXTENSIONS,
     classify,
     clip_xyxy,
@@ -37,6 +38,7 @@ from build_detect_classify_datasets import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = PROJECT_ROOT / "datasets" / "feature_diverse"
+DEFAULT_DROWSINESS_MODEL = PROJECT_ROOT / "videos" / "drowsiness_yolov5_best.onnx"
 
 
 @dataclass
@@ -56,7 +58,10 @@ def parse_args() -> argparse.Namespace:
         help="One or more video/image files or folders",
     )
     parser.add_argument("--detect-model", type=Path, default=DEFAULT_DETECT_MODEL)
-    parser.add_argument("--sleep-model", type=Path, default=DEFAULT_SLEEP_MODEL)
+    parser.add_argument(
+        "--sleep-model", type=Path, default=DEFAULT_DROWSINESS_MODEL,
+        help="YOLOv5 drowsiness ONNX model (normal/drowsy/drowsy#2/yawning).",
+    )
     parser.add_argument("--raisehand-model", type=Path, default=DEFAULT_RAISEHAND_MODEL)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--device", default=None, help="Example: 0 or cpu")
@@ -65,7 +70,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.7)
     parser.add_argument("--visible-class", default="visible person")
-    parser.add_argument("--sleep-positive-id", type=int, default=1)
     parser.add_argument(
         "--raisehand-positive-id", type=int, default=1,
         help="Raw positive class ID returned by the raise-hand classifier. Default: 1",
@@ -77,6 +81,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sleep-conf-threshold", type=float, default=0.8,
         help="Minimum confidence required to assign sleep. Default: 0.8",
+    )
+    parser.add_argument(
+        "--drowsy-positive-ids", type=int, nargs="+", default=[1, 2, 3],
+        help="Raw drowsiness IDs mapped to dataset class 1 (sleep).",
     )
     parser.add_argument(
         "--raisehand-conf-threshold", type=float, default=0.8,
@@ -237,9 +245,16 @@ def run(args: argparse.Namespace) -> int:
     print(f"Found {len(inputs):,} input file(s).")
 
     yolo_root, cls_root = prepare_output(output, args.skip_existing, args.visualize)
-    det_model, sleep_model, raisehand_model = [YOLO(str(path)) for path in model_paths]
+    det_model = YOLO(str(model_paths[0]))
+    sleep_model = YoloV5DrowsinessDetector(
+        model_paths[1], device=args.device, imgsz=args.det_imgsz
+    )
+    raisehand_model = YOLO(str(model_paths[2]))
     print(f"Detector: {model_paths[0]} | names={det_model.names}")
-    print(f"Sleep classifier: {model_paths[1]} | names={sleep_model.names}")
+    print(
+        f"Drowsiness detector: {model_paths[1]} | "
+        "names={0: normal, 1: drowsy, 2: drowsy#2, 3: yawning}"
+    )
     print(f"Raisehand classifier: {model_paths[2]} | names={raisehand_model.names}")
     raisehand_class_ids = (
         set(raisehand_model.names)
@@ -301,7 +316,12 @@ def run(args: argparse.Namespace) -> int:
             if crop.size == 0:
                 continue
 
-            sleep_id, sleep_conf = classify(sleep_model, crop, args.cls_imgsz, args.device)
+            sleep_prediction = sleep_model.predict(
+                crop, conf_threshold=args.sleep_conf_threshold, iou_threshold=args.iou
+            )
+            sleep_id, sleep_conf = (
+                sleep_prediction.class_id, sleep_prediction.confidence
+            )
             raise_id, raise_conf = classify(raisehand_model, crop, args.cls_imgsz, args.device)
             video_stats[f"sleep_raw_{sleep_id}"] += 1
             video_stats[f"raisehand_raw_{raise_id}"] += 1
@@ -326,7 +346,7 @@ def run(args: argparse.Namespace) -> int:
             elif (
                 raise_id == args.raisehand_normal_id
                 and
-                sleep_id == args.sleep_positive_id
+                sleep_id in args.drowsy_positive_ids
                 and sleep_conf >= args.sleep_conf_threshold
             ):
                 label, label_confidence = "sleep", sleep_conf
@@ -334,7 +354,8 @@ def run(args: argparse.Namespace) -> int:
                 rejected_positive = [
                     confidence
                     for raw_id, positive_id, confidence in (
-                        (sleep_id, args.sleep_positive_id, sleep_conf),
+                        (sleep_id, sleep_id if sleep_id in args.drowsy_positive_ids else -1,
+                         sleep_conf),
                         (raise_id, args.raisehand_positive_id, raise_conf),
                     )
                     if raw_id == positive_id
@@ -348,6 +369,7 @@ def run(args: argparse.Namespace) -> int:
             detections.append({
                 "box_index": box_index, "box": box, "crop": crop, "label": label,
                 "label_confidence": label_confidence, "sleep_id": sleep_id,
+                "sleep_name": sleep_prediction.class_name,
                 "sleep_conf": sleep_conf, "raise_id": raise_id, "raise_conf": raise_conf,
             })
 
@@ -442,6 +464,7 @@ def run(args: argparse.Namespace) -> int:
                 "crop": "" if crop_path is None else str(crop_path),
                 "label": label, "class_id": class_id,
                 "sleep_raw_id": item["sleep_id"],
+                "sleep_raw_name": item["sleep_name"],
                 "sleep_confidence": f"{item['sleep_conf']:.6f}",
                 "raisehand_raw_id": item["raise_id"],
                 "raisehand_confidence": f"{item['raise_conf']:.6f}",
@@ -476,7 +499,7 @@ def run(args: argparse.Namespace) -> int:
     fieldnames = [
         "source", "frame_index", "crop_saved", "sample_reason", "nearest_similarity",
         "yolo_image", "yolo_label", "crop", "label", "class_id",
-        "sleep_raw_id", "sleep_confidence", "raisehand_raw_id",
+        "sleep_raw_id", "sleep_raw_name", "sleep_confidence", "raisehand_raw_id",
         "raisehand_confidence", "yolo_line", "x1", "y1", "x2", "y2",
     ]
     with (output / "metadata.csv").open("w", newline="", encoding="utf-8-sig") as file:
